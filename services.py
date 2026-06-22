@@ -5,12 +5,30 @@ from database import ColorGroup, GroupMember, HeartbeatLog
 from schemas import GroupCreate, GroupUpdate, GroupStatus, MemberInfo
 
 
+def _kahan_sum(numbers: List[float]) -> float:
+    total = 0.0
+    compensation = 0.0
+    for num in numbers:
+        y = num - compensation
+        t = total + y
+        compensation = (t - total) - y
+        total = t
+    return total
+
+
 def _calculate_group_stats(members) -> Tuple[Optional[float], Optional[float]]:
     valid_temps = [m.current_color_temp for m in members if m.current_color_temp is not None]
     if not valid_temps:
         return None, None
-    avg_temp = sum(valid_temps) / len(valid_temps)
-    max_diff = max(valid_temps) - min(valid_temps)
+
+    sum_total = _kahan_sum(valid_temps)
+    avg_temp = sum_total / len(valid_temps)
+    avg_temp = round(avg_temp, 2)
+
+    max_temp = max(valid_temps)
+    min_temp = min(valid_temps)
+    max_diff = round(max_temp - min_temp, 2)
+
     return avg_temp, max_diff
 
 

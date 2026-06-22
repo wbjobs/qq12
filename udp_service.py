@@ -1,8 +1,9 @@
 import asyncio
 import json
 import socket
+import platform
 from datetime import datetime
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List
 from database import SessionLocal, ColorGroup, GroupMember, HeartbeatLog
 
 DISCOVER_PORT = 45678
@@ -14,14 +15,41 @@ MEMBER_TIMEOUT = 30
 OnGroupUpdateCallback = Optional[Callable[[str], None]]
 
 
+def _get_all_interface_ips() -> List[str]:
+    ips = set()
+    try:
+        if platform.system() == "Windows":
+            hostname = socket.gethostname()
+            addrinfo = socket.getaddrinfo(hostname, None, family=socket.AF_INET)
+            for info in addrinfo:
+                ip = info[4][0]
+                if not ip.startswith("127."):
+                    ips.add(ip)
+        else:
+            import netifaces
+            for iface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET in addrs:
+                    for addr in addrs[netifaces.AF_INET]:
+                        ip = addr["addr"]
+                        if not ip.startswith("127."):
+                            ips.add(ip)
+    except Exception:
+        pass
+    if not ips:
+        ips.add("0.0.0.0")
+    return list(ips)
+
+
 class UDPService:
     def __init__(self):
-        self._discover_sock: Optional[socket.socket] = None
-        self._heartbeat_sock: Optional[socket.socket] = None
+        self._discover_socks: List[socket.socket] = []
+        self._heartbeat_socks: List[socket.socket] = []
         self._notify_sock: Optional[socket.socket] = None
         self._tasks: list = []
         self._on_group_update: OnGroupUpdateCallback = None
         self._server_host: str = "0.0.0.0"
+        self._all_ips: List[str] = []
 
     def set_group_update_callback(self, callback: OnGroupUpdateCallback):
         self._on_group_update = callback
@@ -36,18 +64,55 @@ class UDPService:
         except Exception:
             return "127.0.0.1"
 
+    def _create_bound_socket(self, port: int, ip: str = "") -> Optional[socket.socket]:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except Exception:
+                    pass
+            sock.bind((ip, port))
+            sock.setblocking(False)
+            return sock
+        except Exception as e:
+            print(f"[UDP] Failed to bind {ip}:{port}: {e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return None
+
     async def start(self):
         self._server_host = self._get_local_ip()
+        self._all_ips = _get_all_interface_ips()
 
-        self._discover_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._discover_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._discover_sock.bind(("", DISCOVER_PORT))
-        self._discover_sock.setblocking(False)
+        print(f"[UDP] Found network interfaces: {self._all_ips}")
 
-        self._heartbeat_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._heartbeat_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._heartbeat_sock.bind(("", HEARTBEAT_PORT))
-        self._heartbeat_sock.setblocking(False)
+        for ip in self._all_ips:
+            sock = self._create_bound_socket(DISCOVER_PORT, ip)
+            if sock:
+                self._discover_socks.append(sock)
+                print(f"[UDP] Discover bound to {ip}:{DISCOVER_PORT}")
+
+        if not self._discover_socks:
+            sock = self._create_bound_socket(DISCOVER_PORT, "")
+            if sock:
+                self._discover_socks.append(sock)
+                print(f"[UDP] Discover bound to 0.0.0.0:{DISCOVER_PORT} (fallback)")
+
+        for ip in self._all_ips:
+            sock = self._create_bound_socket(HEARTBEAT_PORT, ip)
+            if sock:
+                self._heartbeat_socks.append(sock)
+                print(f"[UDP] Heartbeat bound to {ip}:{HEARTBEAT_PORT}")
+
+        if not self._heartbeat_socks:
+            sock = self._create_bound_socket(HEARTBEAT_PORT, "")
+            if sock:
+                self._heartbeat_socks.append(sock)
+                print(f"[UDP] Heartbeat bound to 0.0.0.0:{HEARTBEAT_PORT} (fallback)")
 
         self._notify_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._notify_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -56,24 +121,57 @@ class UDPService:
         self._tasks.append(asyncio.create_task(self._handle_heartbeat()))
         self._tasks.append(asyncio.create_task(self._cleanup_timeout_members()))
 
-        print(f"[UDP] Service started. Server IP: {self._server_host}")
-        print(f"[UDP] Discover on port {DISCOVER_PORT}, Heartbeat on port {HEARTBEAT_PORT}")
+        print(f"[UDP] Service started. Primary Server IP: {self._server_host}")
+        print(f"[UDP] Discover sockets: {len(self._discover_socks)}, Heartbeat sockets: {len(self._heartbeat_socks)}")
 
     async def stop(self):
         for task in self._tasks:
             task.cancel()
-        if self._discover_sock:
-            self._discover_sock.close()
-        if self._heartbeat_sock:
-            self._heartbeat_sock.close()
+        for sock in self._discover_socks:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        for sock in self._heartbeat_socks:
+            try:
+                sock.close()
+            except Exception:
+                pass
         if self._notify_sock:
-            self._notify_sock.close()
+            try:
+                self._notify_sock.close()
+            except Exception:
+                pass
+
+    async def _recv_from_any_sock(self, socks: List[socket.socket]) -> Optional[tuple]:
+        loop = asyncio.get_event_loop()
+        tasks = []
+        for sock in socks:
+            tasks.append(loop.sock_recvfrom(sock, BUFFER_SIZE))
+        if not tasks:
+            await asyncio.sleep(0.1)
+            return None
+        done, pending = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        for task in done:
+            try:
+                return task.result()
+            except Exception:
+                continue
+        return None
 
     async def _handle_discover(self):
         loop = asyncio.get_event_loop()
         while True:
             try:
-                data, addr = await loop.sock_recvfrom(self._discover_sock, BUFFER_SIZE)
+                result = await self._recv_from_any_sock(self._discover_socks)
+                if not result:
+                    continue
+                data, addr = result
                 message = data.decode("utf-8").strip()
                 if message == "DISCOVER":
                     response = json.dumps({
@@ -82,7 +180,12 @@ class UDPService:
                         "heartbeat_port": HEARTBEAT_PORT,
                         "notify_port": NOTIFY_PORT
                     })
-                    await loop.sock_sendto(self._discover_sock, response.encode("utf-8"), addr)
+                    for sock in self._discover_socks:
+                        try:
+                            await loop.sock_sendto(sock, response.encode("utf-8"), addr)
+                            break
+                        except Exception:
+                            continue
                     print(f"[UDP] Discover response sent to {addr}")
             except asyncio.CancelledError:
                 break
@@ -90,10 +193,12 @@ class UDPService:
                 print(f"[UDP] Discover error: {e}")
 
     async def _handle_heartbeat(self):
-        loop = asyncio.get_event_loop()
         while True:
             try:
-                data, addr = await loop.sock_recvfrom(self._heartbeat_sock, BUFFER_SIZE)
+                result = await self._recv_from_any_sock(self._heartbeat_socks)
+                if not result:
+                    continue
+                data, addr = result
                 message = data.decode("utf-8").strip()
                 if message.startswith("REPORT:"):
                     parts = message.split(":")
